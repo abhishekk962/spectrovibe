@@ -4,10 +4,8 @@ A real-time motion detection heatmap visualizer that responds to audio bass leve
 
 ## Preview
 
-<video width="640" height="360" controls>
-  <source src="preview.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+https://github.com/user-attachments/assets/974d9e36-8dab-43d2-b210-24fa7ad956bb
+
 
 ## Features
 
