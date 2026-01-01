@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="logo.png" alt="SpectroVibe Logo" width="356" height="100">
+</div>
+
 # SpectroVibe
 
 A real-time motion detection heatmap visualizer that responds to audio bass levels, using webcam input.

@@ -35,7 +35,7 @@ COLORMAPS = ['HOT', 'JET', 'BONE', 'OCEAN', 'SUMMER', 'PINK']
 # Logo overlay settings
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(SCRIPT_DIR, "logo.png")
-LOGO_SIZE = (240, 100)  # width, height
+LOGO_SIZE = (987//4, 277//4)  # width, height
 LOGO_POSITION = (50, 50)  # x, y offset from top-left
 
 current_rms = 0  # Global RMS value updated by audio callback
