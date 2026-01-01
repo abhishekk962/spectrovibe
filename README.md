@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/974d9e36-8dab-43d2-b210-24fa7ad956bb
 
 - Python 3.x
 - Webcam
-- Audio input device (microphone)
+- Audio input device (microphone) OR Virtual Audio cable (check Audio Setup below)
 - Dependencies: numpy, opencv-python, scipy, sounddevice
 
 ## Installation
