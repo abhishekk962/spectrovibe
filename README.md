@@ -33,7 +33,7 @@ https://github.com/user-attachments/assets/974d9e36-8dab-43d2-b210-24fa7ad956bb
    ```
    pip install -r requirements.txt
    ```
-3. (Optional) Place a `logo.png` file in the same directory as `spectrovibe.py` for logo overlay
+3. Run spectrovibe.py
 
 ## Audio Setup (Windows)
 
