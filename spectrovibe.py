@@ -2,205 +2,241 @@ import cv2
 import numpy as np
 import collections
 import os
-from datetime import datetime
 import sounddevice as sd
 from scipy.signal import butter, lfilter, lfilter_zi
+import time
 
-# Webcam capture instead of video file
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-if not cap.isOpened():
-    raise SystemExit("Cannot open webcam")
 
-# Get original frame size for upsampling display
+# Display settings
+FRAME_WIDTH = 1920
+FRAME_HEIGHT = 1080
+SCALE_FACTOR = 0.25  # Process at 25% resolution for performance
+WAIT_MS = 5  # Frame delay in milliseconds
+LOAD_LOGO = True  # Set to False to disable logo overlay
+
+# Motion detection parameters
+MOTION_THRESHOLD = 6  # Sensitivity for detecting motion
+BLUR_KERNEL = (7, 7)  # Gaussian blur kernel for noise reduction
+DILATE_KERNEL = np.ones((1, 1), np.uint8)  # Kernel for motion dilation
+
+# Audio processing settings
+AUDIO_CHANNELS = 1
+SAMPLE_RATE = 44100
+BASS_CUTOFF_HZ = 200  # Low-pass filter cutoff for bass detection
+AUDIO_DEVICE_INDEX = 2  # Change this to match your audio input device
+
+# Heatmap depth range (controlled by audio RMS)
+MIN_DEPTH = 10  # Minimum frames to accumulate
+MAX_DEPTH = 100  # Maximum frames to accumulate
+
+# Available colormaps for visualization
+COLORMAPS = ['HOT', 'JET', 'BONE', 'OCEAN', 'SUMMER', 'PINK']
+
+# Logo overlay settings
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(SCRIPT_DIR, "logo.png")
+LOGO_SIZE = (240, 100)  # width, height
+LOGO_POSITION = (50, 50)  # x, y offset from top-left
+
+current_rms = 0  # Global RMS value updated by audio callback
+
+
+def create_lowpass_filter(cutoff, sample_rate, order=5):
+    """Create Butterworth low-pass filter coefficients for bass isolation."""
+    nyquist = 0.5 * sample_rate
+    normalized_cutoff = cutoff / nyquist
+    b, a = butter(order, normalized_cutoff, btype='low', analog=False)
+    return b, a
+
+
+# Initialize audio filter
+filter_b, filter_a = create_lowpass_filter(BASS_CUTOFF_HZ, SAMPLE_RATE)
+filter_state = lfilter_zi(filter_b, filter_a)
+
+
+def audio_callback(indata, frames, time, status):
+    """
+    Process incoming audio to extract bass RMS value.
+    This callback runs in a separate thread for real-time audio analysis.
+    """
+    global filter_state, current_rms
+    if status:
+        print(f"Audio status: {status}")
+    
+    samples = indata[:, 0]
+    filtered, filter_state = lfilter(filter_b, filter_a, samples, zi=filter_state)
+    rms = np.sqrt(np.mean(filtered ** 2))
+    current_rms = rms * 65534  # Scale to usable range
+
+
+def initialize_webcam():
+    """Set up webcam capture with HD resolution."""
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    if not cap.isOpened():
+        raise SystemExit("Cannot open webcam")
+    return cap
+
+
+# Initialize capture and get frame dimensions
+cap = initialize_webcam()
 ret_temp, temp_frame = cap.read()
 if not ret_temp:
     raise SystemExit("Cannot read initial frame")
-original_height, original_width = temp_frame.shape[:2]
-cap.release()  # Restart cap to ensure consistency
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
-# Downsampling factor for processing
-scale_factor = 0.25
-low_height = int(original_height * scale_factor)
-low_width = int(original_width * scale_factor)
+original_height, original_width = temp_frame.shape[:2]
+low_width = int(original_width * SCALE_FACTOR)
+low_height = int(original_height * SCALE_FACTOR)
 low_res_size = (low_width, low_height)
 
-MIN_AREA = 1500
-THRESH = 6
-BLUR_KSIZE = (7, 7)
-DILATE_KERNEL = np.ones((1, 1), np.uint8)
-WAIT_MS = 5  # adjust to match video FPS or desired playback speed
-HEATMAP_DEPTH = 50  # number of past frames to accumulate for heatmap
+# Restart capture for clean state
+cap.release()
+cap = initialize_webcam()
 
-# Audio settings
-CHANNELS = 1
-RATE = 44100
-CUTOFF = 200  # Hz for bass
-current_rms = 0
-MIN_DEPTH = 10
-MAX_DEPTH = 100
+def load_logo(path, size):
+    """Load and prepare logo image with alpha channel for overlay."""
+    if not os.path.exists(path):
+        raise SystemExit(f"Logo file not found: {path}")
+    
+    logo = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if logo is None:
+        raise SystemExit("Failed to load logo image")
+    
+    logo = cv2.resize(logo, size, interpolation=cv2.INTER_AREA)
+    
+    # Ensure alpha channel exists
+    if logo.shape[2] != 4:
+        alpha = np.ones((logo.shape[0], logo.shape[1]), dtype=logo.dtype) * 255
+        logo = np.dstack((logo, alpha))
+    
+    return logo
 
-# Filter setup
-def butter_lowpass(cutoff, fs, order=5):
-    nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    b, a = butter(order, normal_cutoff, btype='low', analog=False)
-    return b, a
 
-b, a = butter_lowpass(CUTOFF, RATE)
-zi = lfilter_zi(b, a)
+def overlay_logo(frame, logo, position):
+    """Blend logo onto frame using alpha compositing."""
+    x, y = position
+    h, w = logo.shape[:2]
+    
+    alpha = logo[:, :, 3] / 255.0
+    inverse_alpha = 1.0 - alpha
+    
+    for channel in range(3):
+        frame[y:y+h, x:x+w, channel] = (
+            alpha * logo[:, :, channel] + 
+            inverse_alpha * frame[y:y+h, x:x+w, channel]
+        )
 
-# Audio callback
-def audio_callback(indata, frames, time, status):
-    global zi, current_rms
-    if status:
-        print(status)
-    samples = indata[:, 0]
-    filtered, zi = lfilter(b, a, samples, zi=zi)
-    rms = np.sqrt(np.mean(filtered**2))
-    current_rms = rms * 65534  # Scale to 0-65534
 
-# Colormap options for switching
-COLORMAPS = ['HOT', 'JET', 'BONE', 'OCEAN', 'SUMMER', 'PINK']
-current_colormap = 0
+logo = load_logo(LOGO_PATH, LOGO_SIZE) if os.path.exists(LOGO_PATH) else None
+logo_visible = True
+show_message = True
+start_time = time.time()
 
-print("Controls: SPACE to cycle colormaps, ESC to quit")
-print("Trackbar: Adjust 'Heatmap Depth' slider to control motion trail length")
+print("SpectroVibe Controls:")
+print("  SPACE - Cycle through colormaps")
+print("  ESC   - Exit")
 
-frame1 = None
-frame2 = None
-
-# Read first two frames
+# Read initial frames for motion differencing
 ret1, frame1 = cap.read()
 if not ret1:
-    print("Cannot read from webcam.")
     cap.release()
-    raise SystemExit(1)
+    raise SystemExit("Cannot read from webcam")
 frame1_low = cv2.resize(frame1, low_res_size, interpolation=cv2.INTER_AREA)
 
 ret2, frame2 = cap.read()
 if not ret2:
-    print("Cannot read second frame from webcam.")
     cap.release()
-    raise SystemExit(1)
+    raise SystemExit("Cannot read second frame from webcam")
 frame2_low = cv2.resize(frame2, low_res_size, interpolation=cv2.INTER_AREA)
 
-# Buffer for last HEATMAP_DEPTH dilated images to build heatmap
-dilated_history = collections.deque(maxlen=500)  # large enough for dynamic depth
+# Motion history buffer for heatmap accumulation
+dilated_history = collections.deque(maxlen=500)
+current_colormap = 0
 
-# Create window and trackbar
+# Create fullscreen display window
 cv2.namedWindow("motion", cv2.WND_PROP_FULLSCREEN)
 cv2.setWindowProperty("motion", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-# cv2.createTrackbar('Heatmap Depth', 'motion', HEATMAP_DEPTH, 300, lambda x: None)
 
-# Audio device selection
-devices = sd.query_devices()
-print("Available devices:")
-for i, dev in enumerate(devices):
-    print(f"{i}: {dev['name']}")
-# device_index = int(input("Enter audio device index: "))
-device_index = 2
-
-# Start audio stream
-stream = sd.InputStream(device=device_index, channels=CHANNELS, samplerate=RATE, callback=audio_callback)
+# Start audio input stream
+stream = sd.InputStream(
+    device=AUDIO_DEVICE_INDEX,
+    channels=AUDIO_CHANNELS,
+    samplerate=SAMPLE_RATE,
+    callback=audio_callback
+)
 stream.start()
 
-# Load the logo
-logo_path = "C:\\Data\\DigitalDoubles\\SpectroVibe\\logo.png"  # Ensure the logo file is in the current directory
-if not os.path.exists(logo_path):
-    raise SystemExit(f"Logo file '{logo_path}' not found in the current directory.")
+try:
+    while True:
+        # Detect motion using frame differencing
+        diff = cv2.absdiff(frame1_low, frame2_low)
+        gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, BLUR_KERNEL, 0)
+        _, thresh = cv2.threshold(blur, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+        dilated = cv2.dilate(thresh, DILATE_KERNEL, iterations=2)
+        dilated = cv2.GaussianBlur(dilated, (5, 5), 0)
+        
+        # Store motion mask in history
+        dilated_history.append(dilated.copy())
+        
+        # Calculate heatmap depth based on audio bass intensity
+        depth = int(MIN_DEPTH + (current_rms / 65534) * (MAX_DEPTH - MIN_DEPTH))
+        
+        # Accumulate recent motion frames into heatmap
+        accum = np.sum(list(dilated_history)[-depth:], axis=0)
+        accum_norm = cv2.normalize(accum, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        
+        # Apply colormap to motion heatmap
+        colormap_id = getattr(cv2, f'COLORMAP_{COLORMAPS[current_colormap]}')
+        heatmap = cv2.applyColorMap(accum_norm, colormap_id)
+        
+        # Create grayscale base layer from current frame
+        base_gray = cv2.cvtColor(frame1_low, cv2.COLOR_BGR2GRAY)
+        base_bw = cv2.cvtColor(base_gray, cv2.COLOR_GRAY2BGR)
+        
+        # Blend base layer with heatmap overlay
+        blended = cv2.addWeighted(base_bw, 0.6, heatmap, 0.4, 0)
+        
+        # Upscale to full resolution for display
+        blended_full = cv2.resize(blended, (original_width, original_height), 
+                                   interpolation=cv2.INTER_LINEAR)
+        
+        # Overlay logo if enabled
+        if logo_visible and logo is not None:
+            overlay_logo(blended_full, logo, LOGO_POSITION)
+        
+        # Overlay message if enabled and within timeout
+        if show_message and (time.time() - start_time) < 20:
+            cv2.putText(blended_full, "press SPACE to cycle through colors, press L to hide the logo, press X to hide this message, press ESC to close the app", 
+                        (50, original_height - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        cv2.imshow("motion", blended_full)
+        
+        # Advance frame buffer
+        frame1_low = frame2_low
+        ret, frame2 = cap.read()
+        if not ret:
+            print("Lost webcam connection")
+            break
+        frame2_low = cv2.resize(frame2, low_res_size, interpolation=cv2.INTER_AREA)
+        
+        # Handle keyboard input
+        key = cv2.waitKey(WAIT_MS) & 0xFF
+        if key == 27:  # ESC to exit
+            break
+        elif key == ord(' '):  # Space to cycle colormap
+            current_colormap = (current_colormap + 1) % len(COLORMAPS)
+            print(f"Colormap: {COLORMAPS[current_colormap]}")
+        elif key == ord('l'):  # L to toggle logo visibility
+            logo_visible = not logo_visible
+            print(f"Logo visible: {logo_visible}")
+        elif key == ord('x'):  # X to hide message
+            show_message = False
 
-logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
-if logo is None:
-    raise SystemExit("Failed to load the logo image.")
-
-# Resize the logo to fit in the top-left corner
-logo_height, logo_width = 100, 240  # Adjust dimensions as needed
-logo = cv2.resize(logo, (logo_width, logo_height), interpolation=cv2.INTER_AREA)
-
-# Ensure the logo has an alpha channel for transparency
-if logo.shape[2] != 4:
-    alpha_channel = np.ones((logo.shape[0], logo.shape[1]), dtype=logo.dtype) * 255
-    logo = np.dstack((logo, alpha_channel))
-
-# Function to overlay the logo on a frame
-def overlay_logo(frame, logo):
-    y1, y2 = 50, 50 + logo.shape[0]
-    x1, x2 = 50, 50 + logo.shape[1]
-
-    # Extract the alpha channel from the logo
-    alpha_logo = logo[:, :, 3] / 255.0
-    alpha_frame = 1.0 - alpha_logo
-
-    for c in range(0, 3):
-        frame[y1:y2, x1:x2, c] = (
-            alpha_logo * logo[:, :, c] + alpha_frame * frame[y1:y2, x1:x2, c]
-        )
-
-while True:
-    diff = cv2.absdiff(frame1_low, frame2_low)
-    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, BLUR_KSIZE, 0)
-    _, thresh = cv2.threshold(blur, THRESH, 255, cv2.THRESH_BINARY)
-    dilated = cv2.dilate(thresh, DILATE_KERNEL, iterations=2)
-    dilated = cv2.GaussianBlur(dilated, (5, 5), 0)
-
-    contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    display_low = frame1_low.copy()
-    for contour in contours:
-        if cv2.contourArea(contour) < MIN_AREA:
-            continue
-        x, y, w, h = cv2.boundingRect(contour)
-        # cv2.rectangle(display_low, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-    # Add dilated to history for heatmap
-    dilated_history.append(dilated.copy())
-
-    # Build and overlay heatmap if we have enough frames
-    # depth = max(10, cv2.getTrackbarPos('Heatmap Depth', 'motion'))
-    depth = int(MIN_DEPTH + (current_rms / 65534) * (MAX_DEPTH - MIN_DEPTH))  # Scale RMS to MIN_DEPTH-MAX_DEPTH
-    # if len(dilated_history) >= 200:
-    accum = np.sum(list(dilated_history)[-depth:], axis=0)
-    accum_norm = cv2.normalize(accum, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    colormap_attr = getattr(cv2, f'COLORMAP_{COLORMAPS[current_colormap]}')
-    heatmap = cv2.applyColorMap(accum_norm, colormap_attr)
-    # Stylize base layer: convert to dark black and white
-    base_gray = cv2.cvtColor(display_low, cv2.COLOR_BGR2GRAY)
-    base_bw = cv2.cvtColor(base_gray, cv2.COLOR_GRAY2BGR)
-    base_dark = (base_bw * 1).astype(np.uint8)  # darken to 30% brightness
-    blended = cv2.addWeighted(base_dark, 0.6, heatmap, 0.4, 0)
-    # cv2.putText(blended, f"Colormap: {COLORMAPS[current_colormap]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    # cv2.putText(blended, f"Depth: {depth} (RMS controlled)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    # Upsample to full resolution for display
-    blended_full = cv2.resize(blended, (original_width, original_height), interpolation=cv2.INTER_LINEAR)
-
-    # Overlay the logo on the blended frame
-    # overlay_logo(blended_full, logo)
-
-    # cv2.putText(blended_full, f"Colormap: {COLORMAPS[current_colormap]}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    # cv2.putText(blended_full, f"Depth: {depth} (RMS controlled)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.imshow("motion", blended_full)
-    # During buffering, don't show the window yet
-
-    frame1_low = frame2_low
-    ret, frame2 = cap.read()
-    if not ret:
-        print("Cannot read frame from webcam.")
-        break
-    frame2_low = cv2.resize(frame2, low_res_size, interpolation=cv2.INTER_AREA)
-
-    key = cv2.waitKey(WAIT_MS) & 0xFF
-    if key == 27:  # ESC
-        break
-    elif key == ord(' '):  # Spacebar
-        current_colormap = (current_colormap + 1) % len(COLORMAPS)
-        print(f"Switched to colormap: {COLORMAPS[current_colormap]}")
-
-cv2.destroyAllWindows()
-cap.release()
-stream.stop()
-stream.close()
+finally:
+    # Clean up resources
+    cv2.destroyAllWindows()
+    cap.release()
+    stream.stop()
+    stream.close()
